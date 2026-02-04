@@ -3,7 +3,7 @@ title: OpenAI Sora 2 Video Generator
 description: Pipe Function to enable video generation
 author: Masaoki Kobayashi
 funding_url: FREE
-version: 0.2.1
+version: 0.2.2
 license: MIT
 requirements: typing, pydantic, openai, Pillow, opencv-python
 environment_variables:
@@ -21,7 +21,7 @@ import time
 import uuid
 from typing import Any, List, Dict, Tuple, AsyncGenerator, Callable, Awaitable
 from pydantic import BaseModel, Field
-from openai import OpenAI
+from openai import AsyncOpenAI
 from PIL import Image, ImageFilter
 import cv2
 from open_webui.storage.provider import Storage
@@ -50,6 +50,7 @@ class Pipe:
 
     async def emit_status(self, message: str = "", done: bool = False):
         if self.emitter:
+            print(f"Emitting status {done} {message}")
             await self.emitter(
                 {
                     "type": "status",
@@ -145,6 +146,7 @@ class Pipe:
                 if match:
                     self.remix = True
                     self.vid = match[1]
+                    print(f"Remix mode for video {self.vid}")
                 continue
 
             text = text_item
@@ -194,10 +196,12 @@ class Pipe:
             w, h = pil_image.size
             w //= 2
             h //= 2
+            print(f"Resizing image {w}x{h}")
             pil_image = pil_image.resize((w, h), Image.Resampling.LANCZOS)
             output_buffer = io.BytesIO()
             pil_image.save(output_buffer, format="PNG")
             image_bin = output_buffer.getvalue()
+            print(f"Resized to {len(image_bin)} bytes.")
             return image_bin
 
         cap.release()
@@ -223,19 +227,21 @@ class Pipe:
             str | bytes: output video bytes on success, but string for errors.
             str | None: video id for later remix, None for errors.
         """
+
         await self.emit_status("🖼️ Generating a video...")
         key = self.valves.OPENAI_API_KEY
         if not key:
             return "Error: Valve OPENAI_API_KEY is not set", None
 
-        openai = OpenAI(
+        openai = AsyncOpenAI(
             api_key=key,
             base_url=getattr(self.valves, "BASE_URL", "https://api.openai.com/v1"),
         )
 
         try:
             if self.remix:
-                video = openai.videos.remix(video_id=self.vid, prompt=prompt)
+                video = await openai.videos.remix(video_id=self.vid, prompt=prompt)
+                print(f"Remix prompt: {prompt}")
             else:
                 params = {
                     "model": model,
@@ -249,16 +255,19 @@ class Pipe:
                         input_reference,
                         "image/png",
                     )
-                video = openai.videos.create(**params)
-            time.sleep(30)
+                video = await openai.videos.create(**params)
+            await asyncio.sleep(30)
             while video.status in ("in_progress", "queued"):
-                video = openai.videos.retrieve(video.id)
+                video = await openai.videos.retrieve(video.id)
                 progress = getattr(video, "progress", 0)
                 await self.emit_status(f"⏳ Progress {progress} %", done=False)
-                time.sleep(5)
+                print(f"Video generation progress {progress}")
+                await asyncio.sleep(5)
 
+            print(f"Video generation completed. {video.status}")
             if video.status == "failed":
                 await self.emit_status("❌ Video generation failed", done=True)
+                print(f"{model} failed.", video)
                 err = "Reason unknown"
                 try:
                     err = f"{video.error.code}\n{video.error.message}"
@@ -266,8 +275,10 @@ class Pipe:
                     pass
                 return f"Video generation failed.\n{err}", None
 
-            video_body = openai.videos.download_content(video.id, variant="video")
+            video_body = await openai.videos.download_content(video.id, variant="video")
+            print(f"Video download completed. {video.status}")
             video_bin = await video_body.aread()
+            print(f"Video size {len(video_bin)} bytes.")
             return video_bin, video.id
 
         except Exception as e:
@@ -280,6 +291,11 @@ class Pipe:
         __user__: Dict[str, str],
         __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]] = None,
     ) -> str:
+        print(f"pipe:{__name__}", body)
+        messages = body.get("messages", [])
+        if any("<chat_history>" in m.get("content", "") for m in messages):
+            print(f"Request looks like the followup question.")
+            return ""
         user = Users.get_user_by_id(__user__["id"])
         self.emitter = __event_emitter__
         model_id = body.get("model", "sora-2").split(".")[-1]
@@ -299,18 +315,24 @@ class Pipe:
         self.vid = ""
 
         prompt, image_data = self._extract_prompt(body.get("messages", []))
+        if image_data:
+            print(f"image_data = {image_data[:30]}")
 
         image_bin = None
         if image_data:
             match = re.search(";base64,(.*)$", image_data)
+            print(f"Attached image {image_data[:30]}")
             if match:
                 image_base = base64.b64decode(match[1])
+                print(f"Before adjust: {len(image_base)}")
                 image_bin = self._adjust_size(image_base, size)
+                print(f"After adjust: {len(image_bin)}")
 
         out, vid = await self.generate_video(prompt, model, size, image_bin)
         if type(out) == str:
             return out
         else:
+            print(f"Binary data {len(out)} bytes.")
             id = str(uuid.uuid4())
             filename = f"{id}.mp4"
             md = {
@@ -320,7 +342,9 @@ class Pipe:
                 "OpenWebUI-File-Id": id,
                 "OpenWebUI-Video-Id": vid,
             }
+            print(f"Uploading {filename}")
             contents, file_path = Storage.upload_file(io.BytesIO(out), filename, md)
+            print(f"Uploaded {file_path}")
             file_item = Files.insert_new_file(
                 user.id,
                 FileForm(
@@ -338,7 +362,9 @@ class Pipe:
                     }
                 ),
             )
+            print(f"Registered {file_item.id} {vid}")
             title_image = self._extract_frame(file_path, 45)  # 1.5 sec from beginning
+            print(f"Created title image {len(title_image)} bytes.")
             await self.emit_status("🎉 Video generation successful", done=True)
             if title_image:
                 encoded_title_image = base64.b64encode(title_image).decode("ascii")
