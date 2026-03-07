@@ -2,11 +2,12 @@
 title: OpenAI Sora 2 Video Generator
 description: Pipe Function to enable video generation
 author: Masaoki Kobayashi
-funding_url: FREE
-version: 0.2.2
+author_url: https://github.com/masaoki/sora2-openwebui/
+version: 0.2.3
 license: MIT
-requirements: typing, pydantic, openai, Pillow, opencv-python
+requirements: typing, pydantic, httpx, Pillow, opencv-python
 environment_variables:
+tested_with: OpenWebUI v0.8.8
 disclaimer: This pipe is provided as is without any guarantees.
             Please ensure that it meets your requirements.
 """
@@ -15,14 +16,11 @@ import base64
 import asyncio
 import io
 import re
-import os
-import sys
-import time
 import uuid
-from typing import Any, List, Dict, Tuple, AsyncGenerator, Callable, Awaitable
+import httpx
+from typing import Any, List, Dict, Tuple, Callable, Awaitable
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
-from PIL import Image, ImageFilter
+from PIL import Image, UnidentifiedImageError
 import cv2
 from open_webui.storage.provider import Storage
 from open_webui.models.files import Files, FileForm
@@ -96,7 +94,6 @@ class Pipe:
 
         original_width, original_height = img.size
         original_aspect = original_width / original_height
-
         target_width, target_height = target_size
         target_aspect = target_width / target_height
 
@@ -112,10 +109,10 @@ class Pipe:
 
         cropped_img = img.crop(crop_box)
 
-        # Resize image
+        # Resize the cropped image to fit the target size
         resized_img = cropped_img.resize(target_size, Image.Resampling.LANCZOS)
-
         output_buffer = io.BytesIO()
+        # Save the resized image to the output buffer
         resized_img.save(output_buffer, format="PNG")
         return output_buffer.getvalue()
 
@@ -233,53 +230,69 @@ class Pipe:
         if not key:
             return "Error: Valve OPENAI_API_KEY is not set", None
 
-        openai = AsyncOpenAI(
-            api_key=key,
-            base_url=getattr(self.valves, "BASE_URL", "https://api.openai.com/v1"),
+        base_url = getattr(self.valves, "BASE_URL", "https://api.openai.com/v1").rstrip(
+            "/"
         )
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
 
         try:
-            if self.remix:
-                video = await openai.videos.remix(video_id=self.vid, prompt=prompt)
-                print(f"Remix prompt: {prompt}")
-            else:
-                params = {
+            async with httpx.AsyncClient(timeout=60) as client:
+                payload = {
                     "model": model,
                     "prompt": prompt,
-                    "seconds": getattr(self.valves, "DURATION", "8"),
+                    "seconds": str(getattr(self.valves, "DURATION", "8")),
                     "size": "x".join(str(s) for s in size),
                 }
+                if self.remix:
+                    payload["remix_id"] = self.vid
+
                 if input_reference:
-                    params["input_reference"] = (
-                        "image.png",
-                        input_reference,
-                        "image/png",
+                    payload["input_reference"] = {
+                        "type": "image",
+                        "data": base64.b64encode(input_reference).decode(),
+                        "media_type": "image/png",
+                    }
+
+                r = await client.post(
+                    f"{base_url}/videos", headers=headers, json=payload
+                )
+                if r.status_code != 200:
+                    return f"Error creating video job: {r.status_code} {r.text}", None
+
+                video = r.json()
+                video_id = video["id"]
+
+                # Poll for completion
+                await asyncio.sleep(30)
+                while video.get("status") in ("in_progress", "queued"):
+                    r = await client.get(
+                        f"{base_url}/videos/{video_id}", headers=headers
                     )
-                video = await openai.videos.create(**params)
-            await asyncio.sleep(30)
-            while video.status in ("in_progress", "queued"):
-                video = await openai.videos.retrieve(video.id)
-                progress = getattr(video, "progress", 0)
-                await self.emit_status(f"⏳ Progress {progress} %", done=False)
-                print(f"Video generation progress {progress}")
-                await asyncio.sleep(5)
+                    video = r.json()
+                    progress = video.get("progress", 0)
+                    await self.emit_status(f"⏳ Progress {progress}%", done=False)
+                    print(f"Video generation progress {progress}")
+                    await asyncio.sleep(5)
 
-            print(f"Video generation completed. {video.status}")
-            if video.status == "failed":
-                await self.emit_status("❌ Video generation failed", done=True)
-                print(f"{model} failed.", video)
-                err = "Reason unknown"
-                try:
-                    err = f"{video.error.code}\n{video.error.message}"
-                except:
-                    pass
-                return f"Video generation failed.\n{err}", None
+                if video.get("status") == "failed":
+                    await self.emit_status("❌ Video generation failed", done=True)
+                    err = video.get("error", {}).get("message", "Reason unknown")
+                    return f"Video generation failed.\n{err}", None
 
-            video_body = await openai.videos.download_content(video.id, variant="video")
-            print(f"Video download completed. {video.status}")
-            video_bin = await video_body.aread()
-            print(f"Video size {len(video_bin)} bytes.")
-            return video_bin, video.id
+                # Download video
+                r = await client.get(
+                    f"{base_url}/videos/{video_id}/content",
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=300,
+                    follow_redirects=True,
+                )
+                if r.status_code != 200:
+                    return f"Error downloading video: {r.status_code} {r.text}", None
+
+                return r.content, video_id
 
         except Exception as e:
             await self.emit_status("❌ Video generation failed", done=True)
